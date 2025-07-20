@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import sys
 import os
+import requests
+import httpx
 
 # Add both agent directories to Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'scraping_agent'))
@@ -14,7 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'email_send'))
 from scraping_agent.main import get_professors_data
 from email_agent.main import get_email
 from email_agent.data import get_data
-from email_send.main import send_email as send_email_function, EmailRequest as SendEmailRequest
+from email_send.main import send_email, EmailRequest as SendEmailRequest
 
 app = FastAPI(
     title="Professor Research & Email API",
@@ -54,6 +56,9 @@ class EmailResponse(BaseModel):
     subject: str
     body: str
     to: str
+    
+class CodeModel(BaseModel):
+    code: str
 
 @app.get("/")
 async def root():
@@ -142,11 +147,47 @@ async def send_email_endpoint(request: SendEmailRequest):
         Status of email sending operation
     """
     try:
-        result = await send_email_function(request)
+        result = await send_email(request)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error sending email: {str(e)}")
 
+@app.post("/auth/callback")
+async def auth_callback(request: dict):
+    async with httpx.AsyncClient() as client:
+        token_response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                "code": request["code"],
+                "grant_type": "authorization_code",
+                "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI"),
+            }
+        )
+        
+        if token_response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to exchange code")
+            
+        return token_response.json()
+
+@app.post("/auth/refresh")
+async def refresh_token(request: dict):
+    async with httpx.AsyncClient() as client:
+        refresh_response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                "refresh_token": request["refresh_token"],
+                "grant_type": "refresh_token",
+            }
+        )
+        
+        if refresh_response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to refresh token")
+            
+        return refresh_response.json()
 
 @app.get("/health")
 async def health_check():
