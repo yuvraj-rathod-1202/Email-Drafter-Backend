@@ -118,17 +118,16 @@ def update_email_status(email_id: str, status: str, sent_at: Optional[datetime] 
 async def get_user_tokens(userId: str) -> Optional[Dict]:
     """Get user's OAuth tokens from userTokens collection"""
     try:
-        # Query userTokens collection by user email
-        # Assuming you have a field like 'userEmail' or similar to match
+        # Get userTokens document using userId as document ID
         doc_ref = db.collection('userTokens').document(userId)
         doc = doc_ref.get()
         return doc.to_dict() if doc.exists else None
         
     except Exception as e:
-        logger.error(f"Error fetching user tokens for {user_email}: {e}")
+        logger.error(f"Error fetching user tokens for userId {userId}: {e}")
         return None
 
-async def refresh_user_token(user_email: str, refresh_token: str) -> Optional[Dict]:
+async def refresh_user_token(userId: str, refresh_token: str) -> Optional[Dict]:
     """Refresh user's access token"""
     try:
         async with httpx.AsyncClient() as client:
@@ -149,41 +148,34 @@ async def refresh_user_token(user_email: str, refresh_token: str) -> Optional[Di
                 expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens.get('expires_in', 3600))
                 
                 # Update tokens in database
-                await update_user_tokens(user_email, tokens['access_token'], expires_at)
+                await update_user_tokens(userId, tokens['access_token'], expires_at)
                 
                 return {
                     'access_token': tokens['access_token'],
                     'expires_at': expires_at
                 }
             else:
-                logger.error(f"Token refresh failed for {user_email}: {response.status_code}")
+                logger.error(f"Token refresh failed for userId {userId}: {response.status_code}")
                 return None
                 
     except Exception as e:
-        logger.error(f"Error refreshing token for {user_email}: {e}")
+        logger.error(f"Error refreshing token for userId {userId}: {e}")
         return None
 
-async def update_user_tokens(user_email: str, access_token: str, expires_at: datetime) -> bool:
+async def update_user_tokens(userId: str, access_token: str, expires_at: datetime) -> bool:
     """Update user's tokens in userTokens collection"""
     try:
-        # Find the user's token document
-        query = db.collection('userTokens').where('userEmail', '==', user_email).limit(1)
-        docs = list(query.stream())
-        
-        if docs:
-            doc_ref = docs[0].reference
-            doc_ref.update({
-                'access_token': access_token,
-                'expires_at': expires_at,
-                'updated_at': datetime.now(timezone.utc)
-            })
-            return True
-        else:
-            logger.error(f"No token document found for user: {user_email}")
-            return False
+        # Update the token document using userId as document ID
+        doc_ref = db.collection('userTokens').document(userId)
+        doc_ref.update({
+            'access_token': access_token,
+            'expires_at': expires_at,
+            'updated_at': datetime.now(timezone.utc)
+        })
+        return True
             
     except Exception as e:
-        logger.error(f"Error updating tokens for {user_email}: {e}")
+        logger.error(f"Error updating tokens for userId {userId}: {e}")
         return False
 
 async def send_email_from_user(user_email: str, to_email: str, subject: str, body: str, userId: str) -> bool:
@@ -208,15 +200,18 @@ async def send_email_from_user(user_email: str, to_email: str, subject: str, bod
         
         # 2. Check if token needs refresh
         now = datetime.now(timezone.utc)
-        if expires_at and expires_at < now:
-            logger.info(f"Token expired for {user_email}, refreshing...")
-            refreshed_tokens = await refresh_user_token(user_email, refresh_token)
-            
-            if not refreshed_tokens:
-                logger.error(f"Failed to refresh token for {user_email}")
-                return False
-                
-            access_token = refreshed_tokens['access_token']
+        if expires_at:
+            expires_at_dt = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+
+            if expires_at_dt < now:
+                logger.info(f"Token expired for userId {userId}, refreshing...")
+                refreshed_tokens = await refresh_user_token(userId, refresh_token)
+
+                if not refreshed_tokens:
+                    logger.error(f"Failed to refresh token for userId {userId}")
+                    return False
+
+                access_token = refreshed_tokens['access_token']
         
         # 3. Send email using Gmail API
         email_request = SendEmailRequest(
@@ -460,7 +455,6 @@ async def auth_callback(request: Request):
     print("Received auth callback request", body)
 
     async with httpx.AsyncClient() as client:
-        print("tokenIds", os.getenv("GOOGLE_CLIENT_ID"), os.getenv("GOOGLE_CLIENT_SECRET"))
         token_response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
@@ -469,6 +463,7 @@ async def auth_callback(request: Request):
                 "code": body["code"],
                 "grant_type": "authorization_code",
                 "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI"),
+                "access_type": "offline",
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
