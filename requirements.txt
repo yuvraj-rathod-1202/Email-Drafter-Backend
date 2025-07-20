@@ -7,3 +7,6 @@ requests
 beautifulsoup4
 selenium
 lxml
+httpx
+apscheduler
+firebase-admin

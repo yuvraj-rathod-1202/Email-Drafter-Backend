@@ -5,6 +5,12 @@
 .env.test.local
 .env.production.local
 
+# Firebase
+firebase-service-account.json
+*.json
+!package.json
+!requirements.txt
+
 # Python
 __pycache__/
 *.py[cod]

@@ -6,6 +6,13 @@ import sys
 import os
 import requests
 import httpx
+from datetime import datetime, timezone, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+import firebase_admin
+from firebase_admin import credentials, firestore
+from contextlib import asynccontextmanager
+import logging
 
 # Add both agent directories to Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'scraping_agent'))
@@ -18,10 +25,264 @@ from email_agent.main import get_email
 from email_agent.data import get_data
 from email_send.main import send_email, EmailRequest as SendEmailRequest
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize Firebase
+if not firebase_admin._apps:
+    # Check if service account file exists
+    service_account_path = "firebase-service-account.json"
+    if os.path.exists(service_account_path):
+        cred = credentials.Certificate(service_account_path)
+        firebase_admin.initialize_app(cred)
+    else:
+        # Use environment variables or default credentials
+        firebase_admin.initialize_app()
+        logger.info("Firebase initialized with default credentials")
+
+db = firestore.client()
+scheduler = AsyncIOScheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    scheduler.start()
+    logger.info("Scheduler started")
+    
+    # Add the scheduled job to run every 5 minutes
+    scheduler.add_job(
+        send_scheduled_emails,
+        IntervalTrigger(minutes=5),
+        id='send_scheduled_emails',
+        name='Send scheduled emails',
+        replace_existing=True
+    )
+    
+    yield
+    
+    # Shutdown
+    scheduler.shutdown()
+    logger.info("Scheduler stopped")
+
+# Firebase database functions
+def get_due_scheduled_emails(now: datetime) -> List[Dict]:
+    """Get emails that are scheduled and due to be sent (within 5 minutes of scheduled time)"""
+    try:
+        # Calculate the time window (current time ± 5 minutes)
+        time_window_start = now - timedelta(minutes=5)
+        time_window_end = now + timedelta(minutes=5)
+        
+        query = db.collection('emails').where(
+            'status', '==', 'scheduled'
+        ).where(
+            'scheduledAt', '>=', time_window_start
+        ).where(
+            'scheduledAt', '<=', time_window_end
+        )
+        
+        emails = []
+        for doc in query.stream():
+            email_data = doc.to_dict()
+            email_data['id'] = doc.id
+            emails.append(email_data)
+        
+        return emails
+    except Exception as e:
+        logger.error(f"Error fetching scheduled emails: {e}")
+        return []
+
+def update_email_status(email_id: str, status: str, sent_at: Optional[datetime] = None) -> bool:
+    """Update email status and sentAt timestamp"""
+    try:
+        update_data: Dict[str, Any] = {'status': status}
+        if sent_at:
+            # Firestore automatically handles datetime objects
+            update_data['sentAt'] = sent_at
+            
+        db.collection('emails').document(email_id).update(update_data)
+        return True
+    except Exception as e:
+        logger.error(f"Error updating email status: {e}")
+        return False
+
+async def get_user_tokens(user_email: str) -> Optional[Dict]:
+    """Get user's OAuth tokens from userTokens collection"""
+    try:
+        # Query userTokens collection by user email
+        # Assuming you have a field like 'userEmail' or similar to match
+        query = db.collection('userTokens').where('userEmail', '==', user_email).limit(1)
+        docs = list(query.stream())
+        
+        if docs:
+            doc = docs[0]
+            token_data = doc.to_dict()
+            if token_data:
+                token_data['id'] = doc.id
+                return token_data
+        
+        logger.error(f"No tokens found for user: {user_email}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error fetching user tokens for {user_email}: {e}")
+        return None
+
+async def refresh_user_token(user_email: str, refresh_token: str) -> Optional[Dict]:
+    """Refresh user's access token"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                    "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                }
+            )
+            
+            if response.status_code == 200:
+                tokens = response.json()
+                
+                # Calculate new expiry time
+                expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens.get('expires_in', 3600))
+                
+                # Update tokens in database
+                await update_user_tokens(user_email, tokens['access_token'], expires_at)
+                
+                return {
+                    'access_token': tokens['access_token'],
+                    'expires_at': expires_at
+                }
+            else:
+                logger.error(f"Token refresh failed for {user_email}: {response.status_code}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error refreshing token for {user_email}: {e}")
+        return None
+
+async def update_user_tokens(user_email: str, access_token: str, expires_at: datetime) -> bool:
+    """Update user's tokens in userTokens collection"""
+    try:
+        # Find the user's token document
+        query = db.collection('userTokens').where('userEmail', '==', user_email).limit(1)
+        docs = list(query.stream())
+        
+        if docs:
+            doc_ref = docs[0].reference
+            doc_ref.update({
+                'access_token': access_token,
+                'expires_at': expires_at,
+                'updated_at': datetime.now(timezone.utc)
+            })
+            return True
+        else:
+            logger.error(f"No token document found for user: {user_email}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error updating tokens for {user_email}: {e}")
+        return False
+
+async def send_email_from_user(user_email: str, to_email: str, subject: str, body: str) -> bool:
+    """Send email from user's email to recipient using Gmail API"""
+    try:
+        logger.info(f"Attempting to send email from {user_email} to {to_email}")
+        logger.info(f"Subject: {subject}")
+        
+        # 1. Get user's stored OAuth tokens
+        user_tokens = await get_user_tokens(user_email)
+        if not user_tokens:
+            logger.error(f"No tokens found for user: {user_email}")
+            return False
+        
+        access_token = user_tokens.get('access_token')
+        expires_at = user_tokens.get('expires_at')
+        refresh_token = user_tokens.get('refresh_token')
+        
+        if not access_token or not refresh_token:
+            logger.error(f"Invalid tokens for user: {user_email}")
+            return False
+        
+        # 2. Check if token needs refresh
+        now = datetime.now(timezone.utc)
+        if expires_at and expires_at < now:
+            logger.info(f"Token expired for {user_email}, refreshing...")
+            refreshed_tokens = await refresh_user_token(user_email, refresh_token)
+            
+            if not refreshed_tokens:
+                logger.error(f"Failed to refresh token for {user_email}")
+                return False
+                
+            access_token = refreshed_tokens['access_token']
+        
+        # 3. Send email using Gmail API
+        email_request = SendEmailRequest(
+            access_token=access_token,
+            to=to_email,
+            subject=subject,
+            body=body
+        )
+        
+        result = await send_email(email_request)
+        
+        if 'id' in result:
+            logger.info(f"Email sent successfully from {user_email} to {to_email}")
+            return True
+        else:
+            logger.error(f"Failed to send email from {user_email} to {to_email}: {result}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error sending email from {user_email} to {to_email}: {e}")
+        return False
+
+async def send_scheduled_emails():
+    """Send emails that are scheduled and due to be sent"""
+    try:
+        now = datetime.now(timezone.utc)
+        scheduled_emails = get_due_scheduled_emails(now)
+        
+        logger.info(f"Found {len(scheduled_emails)} emails scheduled for sending")
+        
+        for email in scheduled_emails:
+            try:
+                email_id = email['id']
+                user_email = email['userEmail']
+                to_email = email['professorEmail']
+                subject = email['subject']
+                body = email['body']
+                
+                logger.info(f"Processing scheduled email {email_id} from {user_email} to {to_email}")
+                
+                # Send the email
+                success = await send_email_from_user(user_email, to_email, subject, body)
+                
+                if success:
+                    # Update status to 'sent' and set sentAt timestamp
+                    update_email_status(email_id, 'sent', datetime.now(timezone.utc))
+                    logger.info(f"Successfully sent email {email_id}")
+                else:
+                    # Update status to 'failed'
+                    update_email_status(email_id, 'failed')
+                    logger.error(f"Failed to send email {email_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing email {email.get('id', 'unknown')}: {e}")
+                # Update status to 'failed' on error
+                if 'id' in email:
+                    update_email_status(email['id'], 'failed')
+                
+    except Exception as e:
+        logger.error(f"Error in send_scheduled_emails: {e}")
+
 app = FastAPI(
     title="Professor Research & Email API",
     description="API for finding professors and generating personalized emails",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -60,15 +321,52 @@ class EmailResponse(BaseModel):
 class CodeModel(BaseModel):
     code: str
 
+# Updated model to match your EmailRecord interface
+class EmailRecord(BaseModel):
+    id: Optional[str] = None
+    professorName: str
+    professorEmail: str
+    userEmail: str
+    subject: str
+    body: str
+    status: str  # 'sent' | 'scheduled' | 'delivered' | 'failed'
+    sentAt: Optional[datetime] = None
+    scheduledAt: Optional[datetime] = None
+    researchInterest: str
+    userId: str
+
+class UserTokens(BaseModel):
+    id: Optional[str] = None
+    userEmail: str
+    access_token: str
+    refresh_token: str
+    expires_at: datetime
+    updated_at: datetime
+
 @app.get("/")
 async def root():
     return {
         "message": "Professor Research & Email API",
         "endpoints": {
             "scraping": "/api/scraping",
-            "email": "/api/email",
+            "email": "/api/email", 
             "send-email": "/api/send-email",
+            "scheduled-emails": "/api/scheduled-emails",
+            "trigger-scheduler": "/api/trigger-scheduled-emails",
+            "user-tokens": "/api/user-tokens/{user_email}",
+            "test-email": "/api/test-email-send",
+            "health": "/health",
             "docs": "/docs"
+        },
+        "scheduler": {
+            "status": "running",
+            "interval": "5 minutes",
+            "description": "Automatically sends emails with status 'scheduled' when scheduledAt is within ±5 minutes of current time"
+        },
+        "token_management": {
+            "description": "Automatically retrieves and refreshes user tokens from userTokens collection",
+            "collection": "userTokens",
+            "required_fields": ["userEmail", "access_token", "refresh_token", "expires_at"]
         }
     }
 
