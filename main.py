@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
@@ -13,6 +13,9 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from contextlib import asynccontextmanager
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Add both agent directories to Python path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'scraping_agent'))
@@ -31,15 +34,21 @@ logger = logging.getLogger(__name__)
 
 # Initialize Firebase
 if not firebase_admin._apps:
-    # Check if service account file exists
-    service_account_path = "firebase-service-account.json"
-    if os.path.exists(service_account_path):
-        cred = credentials.Certificate(service_account_path)
+    try:
+        cred = credentials.Certificate({
+            "type": "service_account",
+            "project_id": os.getenv("FIREBASE_PROJECT_ID"),
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
+            "private_key": os.getenv("FIREBASE_PRIVATE_KEY"),
+            "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
+            "client_id": os.getenv("FIREBASE_CLIENT_ID"),
+            "auth_uri": os.getenv("FIREBASE_AUTH_URI"),
+            "token_uri": os.getenv("FIREBASE_TOKEN_URI"),
+        })
         firebase_admin.initialize_app(cred)
-    else:
-        # Use environment variables or default credentials
-        firebase_admin.initialize_app()
-        logger.info("Firebase initialized with default credentials")
+    except Exception as e:
+        print(f"Failed to initialize Firebase: {e}")
+        raise
 
 db = firestore.client()
 scheduler = AsyncIOScheduler()
@@ -53,7 +62,7 @@ async def lifespan(app: FastAPI):
     # Add the scheduled job to run every 5 minutes
     scheduler.add_job(
         send_scheduled_emails,
-        IntervalTrigger(minutes=5),
+        IntervalTrigger(minutes=1),
         id='send_scheduled_emails',
         name='Send scheduled emails',
         replace_existing=True
@@ -106,23 +115,14 @@ def update_email_status(email_id: str, status: str, sent_at: Optional[datetime] 
         logger.error(f"Error updating email status: {e}")
         return False
 
-async def get_user_tokens(user_email: str) -> Optional[Dict]:
+async def get_user_tokens(userId: str) -> Optional[Dict]:
     """Get user's OAuth tokens from userTokens collection"""
     try:
         # Query userTokens collection by user email
         # Assuming you have a field like 'userEmail' or similar to match
-        query = db.collection('userTokens').where('userEmail', '==', user_email).limit(1)
-        docs = list(query.stream())
-        
-        if docs:
-            doc = docs[0]
-            token_data = doc.to_dict()
-            if token_data:
-                token_data['id'] = doc.id
-                return token_data
-        
-        logger.error(f"No tokens found for user: {user_email}")
-        return None
+        doc_ref = db.collection('userTokens').document(userId)
+        doc = doc_ref.get()
+        return doc.to_dict() if doc.exists else None
         
     except Exception as e:
         logger.error(f"Error fetching user tokens for {user_email}: {e}")
@@ -186,14 +186,14 @@ async def update_user_tokens(user_email: str, access_token: str, expires_at: dat
         logger.error(f"Error updating tokens for {user_email}: {e}")
         return False
 
-async def send_email_from_user(user_email: str, to_email: str, subject: str, body: str) -> bool:
+async def send_email_from_user(user_email: str, to_email: str, subject: str, body: str, userId: str) -> bool:
     """Send email from user's email to recipient using Gmail API"""
     try:
         logger.info(f"Attempting to send email from {user_email} to {to_email}")
         logger.info(f"Subject: {subject}")
         
         # 1. Get user's stored OAuth tokens
-        user_tokens = await get_user_tokens(user_email)
+        user_tokens = await get_user_tokens(userId)
         if not user_tokens:
             logger.error(f"No tokens found for user: {user_email}")
             return False
@@ -228,7 +228,7 @@ async def send_email_from_user(user_email: str, to_email: str, subject: str, bod
         
         result = await send_email(email_request)
         
-        if 'id' in result:
+        if "id" in result:
             logger.info(f"Email sent successfully from {user_email} to {to_email}")
             return True
         else:
@@ -244,21 +244,21 @@ async def send_scheduled_emails():
     try:
         now = datetime.now(timezone.utc)
         scheduled_emails = get_due_scheduled_emails(now)
-        
+        print("Found scheduled emails:")
         logger.info(f"Found {len(scheduled_emails)} emails scheduled for sending")
         
         for email in scheduled_emails:
             try:
                 email_id = email['id']
                 user_email = email['userEmail']
-                to_email = email['professorEmail']
+                to_email = email['to']
                 subject = email['subject']
                 body = email['body']
                 
                 logger.info(f"Processing scheduled email {email_id} from {user_email} to {to_email}")
                 
                 # Send the email
-                success = await send_email_from_user(user_email, to_email, subject, body)
+                success = await send_email_from_user(user_email, to_email, subject, body, email['userId'])
                 
                 if success:
                     # Update status to 'sent' and set sentAt timestamp
@@ -450,41 +450,56 @@ async def send_email_endpoint(request: SendEmailRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error sending email: {str(e)}")
 
+from fastapi import Request
+
 @app.post("/auth/callback")
-async def auth_callback(request: dict):
+async def auth_callback(request: Request):
+    body = await request.json()  # If frontend sends JSON
+    # Or use: body = await request.form() if sent as form-data
+
+    print("Received auth callback request", body)
+
     async with httpx.AsyncClient() as client:
+        print("tokenIds", os.getenv("GOOGLE_CLIENT_ID"), os.getenv("GOOGLE_CLIENT_SECRET"))
         token_response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
                 "client_id": os.getenv("GOOGLE_CLIENT_ID"),
                 "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-                "code": request["code"],
+                "code": body["code"],
                 "grant_type": "authorization_code",
                 "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI"),
-            }
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        
+
         if token_response.status_code != 200:
+            print("Google Token Error:", token_response.text)
             raise HTTPException(status_code=400, detail="Failed to exchange code")
-            
+
         return token_response.json()
 
+
 @app.post("/auth/refresh")
-async def refresh_token(request: dict):
+async def refresh_token(request: Request):
+    body = await request.json()
+    
     async with httpx.AsyncClient() as client:
         refresh_response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
                 "client_id": os.getenv("GOOGLE_CLIENT_ID"),
                 "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-                "refresh_token": request["refresh_token"],
+                "refresh_token": body["refresh_token"],
                 "grant_type": "refresh_token",
-            }
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        
+
         if refresh_response.status_code != 200:
+            print("Refresh Token Error:", refresh_response.text)
             raise HTTPException(status_code=400, detail="Failed to refresh token")
-            
+
         return refresh_response.json()
 
 @app.get("/health")

@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Test script for the updated email scheduling functionality
-Works with existing emails collection in Firestore
-"""
-
 import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
