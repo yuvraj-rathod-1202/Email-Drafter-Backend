@@ -283,7 +283,11 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://academic-agent-outreach.vercel.app"],  # Allows all origins
+    allow_origins=[
+        "https://academic-email-agent.vercel.app",
+        "http://localhost:8081",
+        "http://localhost:3000"
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
