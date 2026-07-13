@@ -2,6 +2,8 @@
 
 A FastAPI-based web service that combines professor research data scraping with personalized email generation capabilities.
 
+**Frontend Repository**: [academic-agent-outreach](https://github.com/yuvraj-rathod-1202/academic-agent-outreach)
+
 ## Features
 
 - **Professor Data Scraping**: Find professors based on research interests and requirements
